@@ -16,16 +16,21 @@ run:
 	--ui-logo=https://raw.githubusercontent.com/stefanprodan/podinfo/gh-pages/cuddle_clap.gif $(EXTRA_RUN_ARGS)
 
 .PHONY: test
-test:
+test: tidy fmt vet
 	go test ./... -coverprofile cover.out
 
 build:
 	GIT_COMMIT=$$(git rev-list -1 HEAD) && CGO_ENABLED=0 go build  -ldflags "-s -w -X github.com/stefanprodan/podinfo/pkg/version.REVISION=$(GIT_COMMIT)" -a -o ./bin/podinfo ./cmd/podinfo/*
 	GIT_COMMIT=$$(git rev-list -1 HEAD) && CGO_ENABLED=0 go build  -ldflags "-s -w -X github.com/stefanprodan/podinfo/pkg/version.REVISION=$(GIT_COMMIT)" -a -o ./bin/podcli ./cmd/podcli/*
 
+tidy:
+	rm -f go.sum; go mod tidy -compat=1.26
+
+vet:
+	go vet ./...
+
 fmt:
-	gofmt -l -s -w ./
-	goimports -l -w ./
+	go fmt ./...
 
 build-charts:
 	helm lint charts/*
@@ -34,19 +39,6 @@ build-charts:
 build-container:
 	docker build -t $(DOCKER_IMAGE_NAME):$(VERSION) .
 
-build-xx:
-	docker buildx build \
-	--platform=linux/amd64 \
-	-t $(DOCKER_IMAGE_NAME):$(VERSION) \
-	--load \
-	-f Dockerfile.xx .
-
-build-base:
-	docker build -f Dockerfile.base -t $(DOCKER_REPOSITORY)/podinfo-base:latest .
-
-push-base: build-base
-	docker push $(DOCKER_REPOSITORY)/podinfo-base:latest
-
 test-container:
 	@docker rm -f podinfo || true
 	@docker run -dp 9898:9898 --name=podinfo $(DOCKER_IMAGE_NAME):$(VERSION)
@@ -54,34 +46,45 @@ test-container:
 	@TOKEN=$$(curl -sd 'test' localhost:9898/token | jq -r .token) && \
 	curl -sH "Authorization: Bearer $${TOKEN}" localhost:9898/token/validate | grep test
 
-push-container:
-	docker tag $(DOCKER_IMAGE_NAME):$(VERSION) $(DOCKER_IMAGE_NAME):latest
-	docker push $(DOCKER_IMAGE_NAME):$(VERSION)
-	docker push $(DOCKER_IMAGE_NAME):latest
-	docker tag $(DOCKER_IMAGE_NAME):$(VERSION) quay.io/$(DOCKER_IMAGE_NAME):$(VERSION)
-	docker tag $(DOCKER_IMAGE_NAME):$(VERSION) quay.io/$(DOCKER_IMAGE_NAME):latest
-	docker push quay.io/$(DOCKER_IMAGE_NAME):$(VERSION)
-	docker push quay.io/$(DOCKER_IMAGE_NAME):latest
-
 version-set:
 	@next="$(TAG)" && \
 	current="$(VERSION)" && \
-	sed -i '' "s/$$current/$$next/g" pkg/version/version.go && \
-	sed -i '' "s/tag: $$current/tag: $$next/g" charts/podinfo/values.yaml && \
-	sed -i '' "s/tag: $$current/tag: $$next/g" charts/podinfo/values-prod.yaml && \
-	sed -i '' "s/appVersion: $$current/appVersion: $$next/g" charts/podinfo/Chart.yaml && \
-	sed -i '' "s/version: $$current/version: $$next/g" charts/podinfo/Chart.yaml && \
-	sed -i '' "s/podinfo:$$current/podinfo:$$next/g" kustomize/deployment.yaml && \
-	sed -i '' "s/podinfo:$$current/podinfo:$$next/g" deploy/webapp/frontend/deployment.yaml && \
-	sed -i '' "s/podinfo:$$current/podinfo:$$next/g" deploy/webapp/backend/deployment.yaml && \
-	sed -i '' "s/podinfo:$$current/podinfo:$$next/g" deploy/bases/frontend/deployment.yaml && \
-	sed -i '' "s/podinfo:$$current/podinfo:$$next/g" deploy/bases/backend/deployment.yaml && \
-	echo "Version $$next set in code, deployment, chart and kustomize"
+	perl -i -pe "s/\Q$$current\E/$$next/g" pkg/version/version.go && \
+	perl -i -pe "s/tag: \Q$$current\E/tag: $$next/g" charts/podinfo/values.yaml && \
+	perl -i -pe "s/tag: \Q$$current\E/tag: $$next/g" charts/podinfo/values-prod.yaml && \
+	perl -i -pe "s/appVersion: \Q$$current\E/appVersion: $$next/g" charts/podinfo/Chart.yaml && \
+	perl -i -pe "s/version: \Q$$current\E/version: $$next/g" charts/podinfo/Chart.yaml && \
+	perl -0777 -i -pe "s/(repository: \*\"ghcr.io\/stefanprodan\/podinfo\" \| string\n\s*tag:\s*\*\")\Q$$current\E\"/\$${1}$$next\"/" timoni/podinfo/images.cue && \
+	grep -rl "podinfo:$$current" deploy kustomize | xargs perl -i -pe "s/\Qpodinfo:$$current\E/podinfo:$$next/g" && \
+	echo "Version $$next set in code, deployment, module, chart and kustomize"
+
+prep-release:
+	@branch="$$(git rev-parse --abbrev-ref HEAD)" && \
+	if [ "$$branch" != "master" ]; then \
+		echo "Error: prep-release must be run from the master branch (current: $$branch)"; \
+		exit 1; \
+	fi && \
+	git pull origin master && \
+	next="$(TAG)" && \
+	if [ "$$next" = "latest" ]; then \
+		next="$$(echo $(VERSION) | awk -F. '{ printf "%d.%d.%d", $$1, $$2+1, 0 }')"; \
+	fi && \
+	git checkout -b release-$$next && \
+	$(MAKE) version-set TAG=$$next && \
+	git commit -am "Release $$next" && \
+	git push origin release-$$next && \
+	gh pr create --title "Release $$next" --body "Prepare for $$next release" --base master --head release-$$next
 
 release:
-	git tag $(VERSION)
+	git tag -s -m $(VERSION) $(VERSION)
 	git push origin $(VERSION)
 
 swagger:
-	go get github.com/swaggo/swag/cmd/swag
-	cd pkg/api && $$(go env GOPATH)/bin/swag init -g server.go
+	go install github.com/swaggo/swag/cmd/swag@latest
+	go get github.com/swaggo/swag/gen@latest
+	go get github.com/swaggo/swag/cmd/swag@latest
+	cd pkg/api/http && $$(go env GOPATH)/bin/swag init -g server.go
+
+.PHONY: timoni-build
+timoni-build:
+	@timoni build podinfo ./timoni/podinfo -f ./timoni/podinfo/debug_values.cue

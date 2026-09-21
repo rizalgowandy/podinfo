@@ -1,8 +1,8 @@
 package main
 
 import (
+	"context"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -11,29 +11,36 @@ import (
 
 	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
+	"go.opentelemetry.io/contrib/bridges/otelzap"
+	"go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploggrpc"
+	sdklog "go.opentelemetry.io/otel/sdk/log"
+	"go.opentelemetry.io/otel/sdk/resource"
+	semconv "go.opentelemetry.io/otel/semconv/v1.7.0"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 
-	"github.com/stefanprodan/podinfo/pkg/api"
-	"github.com/stefanprodan/podinfo/pkg/grpc"
+	"github.com/stefanprodan/podinfo/pkg/api/grpc"
+	"github.com/stefanprodan/podinfo/pkg/api/http"
 	"github.com/stefanprodan/podinfo/pkg/signals"
 	"github.com/stefanprodan/podinfo/pkg/version"
+	go_grpc "google.golang.org/grpc"
 )
 
 func main() {
 	// flags definition
 	fs := pflag.NewFlagSet("default", pflag.ContinueOnError)
 	fs.String("host", "", "Host to bind service to")
+	fs.String("prefix", "/", "URL path prefix for HTTP routes")
 	fs.Int("port", 9898, "HTTP port to bind service to")
 	fs.Int("secure-port", 0, "HTTPS port")
 	fs.Int("port-metrics", 0, "metrics port")
 	fs.Int("grpc-port", 0, "gRPC port")
 	fs.String("grpc-service-name", "podinfo", "gPRC service name")
-	fs.String("level", "info", "log level debug, info, warn, error, flat or panic")
+	fs.String("level", "info", "log level debug, info, warn, error, fatal or panic")
 	fs.StringSlice("backend-url", []string{}, "backend service URL")
 	fs.Duration("http-client-timeout", 2*time.Minute, "client timeout duration")
 	fs.Duration("http-server-timeout", 30*time.Second, "server read and write timeout duration")
-	fs.Duration("http-server-shutdown-timeout", 5*time.Second, "server graceful shutdown timeout duration")
+	fs.Duration("server-shutdown-timeout", 5*time.Second, "server graceful shutdown timeout duration")
 	fs.String("data-path", "/data", "data local path")
 	fs.String("config-path", "", "config dir path")
 	fs.String("cert-path", "/data/cert", "certificate path for HTTPS port")
@@ -52,7 +59,8 @@ func main() {
 	fs.Bool("unready", false, "when set, ready state is never reached")
 	fs.Int("stress-cpu", 0, "number of CPU cores with 100 load")
 	fs.Int("stress-memory", 0, "MB of data to load into memory")
-	fs.String("cache-server", "", "Redis address in the format <host>:<port>")
+	fs.String("cache-server", "", "Redis address in the format 'tcp://<host>:<port>'")
+	fs.String("otel-service-name", "", "service name for OpenTelemetry, when not set tracing and log export are disabled")
 
 	versionFlag := fs.BoolP("version", "v", false, "get version number")
 
@@ -92,8 +100,18 @@ func main() {
 		}
 	}
 
+	// initialize OTel log provider if service name is set
+	var loggerProvider *sdklog.LoggerProvider
+	if otelServiceName := viper.GetString("otel-service-name"); otelServiceName != "" {
+		var err error
+		loggerProvider, err = initLoggerProvider(context.Background(), otelServiceName)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error initializing OTel log provider: %s\n", err.Error())
+		}
+	}
+
 	// configure logging
-	logger, _ := initZap(viper.GetString("level"))
+	logger, _ := initZap(viper.GetString("level"), loggerProvider)
 	defer logger.Sync()
 	stdLog := zap.RedirectStdLog(logger)
 	defer stdLog()
@@ -134,13 +152,16 @@ func main() {
 	}
 
 	// start gRPC server
+	var grpcServer *go_grpc.Server
 	if grpcCfg.Port > 0 {
 		grpcSrv, _ := grpc.NewServer(&grpcCfg, logger)
-		go grpcSrv.ListenAndServe()
+		//grpcinfoSrv, _ := grpc.NewInfoServer(&grpcCfg)
+
+		grpcServer = grpcSrv.ListenAndServe()
 	}
 
 	// load HTTP server config
-	var srvCfg api.Config
+	var srvCfg http.Config
 	if err := viper.Unmarshal(&srvCfg); err != nil {
 		logger.Panic("config unmarshal failed", zap.Error(err))
 	}
@@ -153,12 +174,35 @@ func main() {
 	)
 
 	// start HTTP server
-	srv, _ := api.NewServer(&srvCfg, logger)
+	srv, _ := http.NewServer(&srvCfg, logger)
+	httpServer, httpsServer, healthy, ready := srv.ListenAndServe()
+
+	// graceful shutdown
 	stopCh := signals.SetupSignalHandler()
-	srv.ListenAndServe(stopCh)
+	sd, _ := signals.NewShutdown(srvCfg.ServerShutdownTimeout, logger)
+	sd.SetLoggerProvider(loggerProvider)
+	sd.Graceful(stopCh, httpServer, httpsServer, grpcServer, healthy, ready)
 }
 
-func initZap(logLevel string) (*zap.Logger, error) {
+func initLoggerProvider(ctx context.Context, serviceName string) (*sdklog.LoggerProvider, error) {
+	exporter, err := otlploggrpc.New(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("creating OTLP log exporter: %w", err)
+	}
+
+	provider := sdklog.NewLoggerProvider(
+		sdklog.WithProcessor(sdklog.NewBatchProcessor(exporter)),
+		sdklog.WithResource(resource.NewWithAttributes(
+			semconv.SchemaURL,
+			semconv.ServiceNameKey.String(serviceName),
+			semconv.ServiceVersionKey.String(version.VERSION),
+		)),
+	)
+
+	return provider, nil
+}
+
+func initZap(logLevel string, loggerProvider *sdklog.LoggerProvider) (*zap.Logger, error) {
 	level := zap.NewAtomicLevelAt(zapcore.InfoLevel)
 	switch logLevel {
 	case "debug":
@@ -202,7 +246,21 @@ func initZap(logLevel string) (*zap.Logger, error) {
 		ErrorOutputPaths: []string{"stderr"},
 	}
 
-	return zapConfig.Build()
+	logger, err := zapConfig.Build()
+	if err != nil {
+		return nil, err
+	}
+
+	if loggerProvider != nil {
+		otelCore := otelzap.NewCore("github.com/stefanprodan/podinfo",
+			otelzap.WithLoggerProvider(loggerProvider),
+		)
+		logger = logger.WithOptions(zap.WrapCore(func(core zapcore.Core) zapcore.Core {
+			return zapcore.NewTee(core, otelCore)
+		}))
+	}
+
+	return logger, nil
 }
 
 var stressMemoryPayload []byte
@@ -237,12 +295,12 @@ func beginStressTest(cpus int, mem int, logger *zap.Logger) {
 			logger.Error("memory stress failed", zap.Error(err))
 		}
 
-		stressMemoryPayload, err = ioutil.ReadFile(path)
+		stressMemoryPayload, err = os.ReadFile(path)
 		f.Close()
 		os.Remove(path)
 		if err != nil {
 			logger.Error("memory stress failed", zap.Error(err))
 		}
-		logger.Info("starting CPU stress", zap.Int("memory", len(stressMemoryPayload)))
+		logger.Info("starting MEMORY stress", zap.Int("memory", len(stressMemoryPayload)))
 	}
 }

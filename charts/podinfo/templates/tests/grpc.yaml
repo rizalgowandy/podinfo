@@ -2,6 +2,7 @@ apiVersion: v1
 kind: Pod
 metadata:
   name: {{ template "podinfo.fullname" . }}-grpc-test-{{ randAlphaNum 5 | lower }}
+  namespace: {{ include "podinfo.namespace" . }}
   labels:
     {{- include "podinfo.labels" . | nindent 4 }}
   annotations:
@@ -13,7 +14,6 @@ metadata:
 spec:
   containers:
     - name: grpc-health-probe
-      image: stefanprodan/grpc_health_probe:v0.3.0
-      command: ['grpc_health_probe']
-      args:  ['-addr={{ template "podinfo.fullname" . }}.{{ .Release.Namespace }}:{{ .Values.service.grpcPort }}']
+      image: ghcr.io/grpc-ecosystem/grpc-health-probe:v0.4.56
+      args:  ['-addr={{ template "podinfo.fullname" . }}.{{ include "podinfo.namespace" . }}:{{ .Values.service.grpcPort }}']
   restartPolicy: Never

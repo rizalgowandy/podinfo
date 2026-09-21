@@ -3,8 +3,9 @@
 [![e2e](https://github.com/stefanprodan/podinfo/workflows/e2e/badge.svg)](https://github.com/stefanprodan/podinfo/blob/master/.github/workflows/e2e.yml)
 [![test](https://github.com/stefanprodan/podinfo/workflows/test/badge.svg)](https://github.com/stefanprodan/podinfo/blob/master/.github/workflows/test.yml)
 [![cve-scan](https://github.com/stefanprodan/podinfo/workflows/cve-scan/badge.svg)](https://github.com/stefanprodan/podinfo/blob/master/.github/workflows/cve-scan.yml)
-[![Go Report Card](https://goreportcard.com/badge/github.com/stefanprodan/podinfo)](https://goreportcard.com/report/github.com/stefanprodan/podinfo)
 [![Docker Pulls](https://img.shields.io/docker/pulls/stefanprodan/podinfo)](https://hub.docker.com/r/stefanprodan/podinfo)
+[![slsa](https://slsa.dev/images/gh-badge-level2.svg)](https://github.com/stefanprodan/podinfo/attestations)
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/stefanprodan/podinfo)
 
 Podinfo is a tiny web application made with Go that showcases best practices of running microservices in Kubernetes.
 Podinfo is used by CNCF projects like [Flux](https://github.com/fluxcd/flux2) and [Flagger](https://github.com/fluxcd/flagger)
@@ -15,18 +16,17 @@ Specifications:
 * Health checks (readiness and liveness)
 * Graceful shutdown on interrupt signals
 * File watcher for secrets and configmaps
-* Instrumented with Prometheus
-* Tracing with Istio and Jaeger
-* Linkerd service profile
+* Instrumented with Prometheus and Open Telemetry
 * Structured logging with zap 
 * 12-factor app with viper
 * Fault injection (random errors and latency)
 * Swagger docs
-* Helm and Kustomize installers
+* Timoni, Helm and Kustomize installers
 * End-to-End testing with Kubernetes Kind and Helm
-* Kustomize testing with GitHub Actions and Open Policy Agent
-* Multi-arch container image with Docker buildx and Github Actions
-* CVE scanning with trivy
+* Multi-arch container image with Docker buildx and GitHub Actions
+* Container image signing with Sigstore cosign
+* SBOMs and SLSA Provenance embedded in the container image
+* CVE scanning with govulncheck
 
 Web API:
 
@@ -37,6 +37,9 @@ Web API:
 * `GET /readyz` used by Kubernetes readiness probe
 * `POST /readyz/enable` signals the Kubernetes LB that this instance is ready to receive traffic
 * `POST /readyz/disable` signals the Kubernetes LB to stop sending requests to this instance
+* `POST /fault_injection/enable` makes this instance respond with HTTP 500 to all application endpoints (probes, metrics, pprof and the `/fault_injection/*` control endpoints stay healthy) — useful for testing client-side circuit breakers / outlier detection against a single "sick" replica
+* `POST /fault_injection/disable` restores normal responses
+* `GET /fault_injection/status` returns the current fault injection state (`enabled` or `disabled`)
 * `GET /status/{code}` returns the status code
 * `GET /panic` crashes the process with exit code 255
 * `POST /echo` forwards the call to the backend service and echos the posted content 
@@ -58,6 +61,16 @@ Web API:
 gRPC API:
 
 * `/grpc.health.v1.Health/Check` health checking
+* `/grpc.EchoService/Echo` echos the received content
+* `/grpc.VersionService/Version` returns podinfo version and Git commit hash
+* `/grpc.DelayService/Delay` returns a successful response after the given seconds in the body of gRPC request
+* `/grpc.EnvService/Env` returns environment variables as a JSON array
+* `/grpc.HeaderService/Header` returns the headers present in the gRPC request. Any custom header can also be given as a part of request and that can be returned using this API
+* `/grpc.InfoService/Info` returns the runtime information
+* `/grpc.PanicService/Panic` crashes the process with gRPC status code as '1 CANCELLED'
+* `/grpc.StatusService/Status` returns the gRPC Status code given in the request body
+* `/grpc.TokenService/TokenGenerate` issues a JWT token valid for one minute
+* `/grpc.TokenService/TokenValidate` validates the JWT token
 
 Web UI:
 
@@ -67,17 +80,26 @@ To access the Swagger UI open `<podinfo-host>/swagger/index.html` in a browser.
 
 ### Guides
 
-* [GitOps Progressive Deliver with Flagger, Helm v3 and Linkerd](https://helm.workshop.flagger.dev/intro/)
-* [GitOps Progressive Deliver on EKS with Flagger and AppMesh](https://eks.handson.flagger.dev/prerequisites/)
-* [Automated canary deployments with Flagger and Istio](https://medium.com/google-cloud/automated-canary-deployments-with-flagger-and-istio-ac747827f9d1)
-* [Kubernetes autoscaling with Istio metrics](https://medium.com/google-cloud/kubernetes-autoscaling-with-istio-metrics-76442253a45a)
-* [Autoscaling EKS on Fargate with custom metrics](https://aws.amazon.com/blogs/containers/autoscaling-eks-on-fargate-with-custom-metrics/)
-* [Managing Helm releases the GitOps way](https://medium.com/google-cloud/managing-helm-releases-the-gitops-way-207a6ac6ff0e)
-* [Securing EKS Ingress With Contour And Let’s Encrypt The GitOps Way](https://aws.amazon.com/blogs/containers/securing-eks-ingress-contour-lets-encrypt-gitops/)
+* [Getting started with Timoni](https://timoni.sh/quickstart/)
+* [Getting started with Flux](https://fluxcd.io/flux/get-started/)
+* [Progressive Deliver with Flagger and Linkerd](https://docs.flagger.app/tutorials/linkerd-progressive-delivery)
+* [Automated canary deployments with Kubernetes Gateway API](https://docs.flagger.app/tutorials/gatewayapi-progressive-delivery)
 
 ### Install
 
-Helm:
+To install Podinfo on Kubernetes the minimum required version is **Kubernetes v1.23**.
+
+#### Timoni
+
+Install with [Timoni](https://timoni.sh):
+
+```bash
+timoni -n default apply podinfo oci://ghcr.io/stefanprodan/modules/podinfo
+```
+
+#### Helm
+
+Install from github.io:
 
 ```bash
 helm repo add podinfo https://stefanprodan.github.io/podinfo
@@ -88,7 +110,7 @@ helm upgrade --install --wait frontend \
 --set backend=http://backend-podinfo:9898/echo \
 podinfo/podinfo
 
-helm test frontend
+helm test frontend --namespace test
 
 helm upgrade --install --wait backend \
 --namespace test \
@@ -96,13 +118,20 @@ helm upgrade --install --wait backend \
 podinfo/podinfo
 ```
 
-Kustomize:
+Install from ghcr.io:
+
+```bash
+helm upgrade --install --wait podinfo --namespace default \
+oci://ghcr.io/stefanprodan/charts/podinfo
+```
+
+#### Kustomize
 
 ```bash
 kubectl apply -k github.com/stefanprodan/podinfo//kustomize
 ```
 
-Docker:
+#### Docker
 
 ```bash
 docker run -dp 9898:9898 stefanprodan/podinfo

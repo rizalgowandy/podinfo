@@ -3,6 +3,7 @@ apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
   name: {{ template "podinfo.fullname" . }}
+  namespace: {{ include "podinfo.namespace" . }}
   labels:
     {{- include "podinfo.labels" . | nindent 4 }}
     {{- with .Values.serviceMonitor.additionalLabels }}
@@ -10,12 +11,12 @@ metadata:
     {{- end }}
 spec:
   endpoints:
-    - path: /metrics
+    - path: {{ trimSuffix "/" (.Values.prefix | default "/") }}/metrics
       port: http
       interval: {{ .Values.serviceMonitor.interval }}
   namespaceSelector:
     matchNames:
-      - {{ .Release.Namespace }}
+      - {{ include "podinfo.namespace" . }}
   selector:
     matchLabels:
       {{- include "podinfo.selectorLabels" . | nindent 6 }}

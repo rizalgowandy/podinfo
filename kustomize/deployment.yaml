@@ -23,7 +23,7 @@ spec:
     spec:
       containers:
       - name: podinfod
-        image: ghcr.io/stefanprodan/podinfo:6.0.3
+        image: ghcr.io/stefanprodan/podinfo:6.15.0
         imagePullPolicy: IfNotPresent
         ports:
         - name: http
@@ -72,3 +72,9 @@ spec:
           requests:
             cpu: 100m
             memory: 64Mi
+        volumeMounts:
+          - name: data
+            mountPath: /data
+      volumes:
+        - name: data
+          emptyDir: {}
